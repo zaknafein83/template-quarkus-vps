@@ -1,0 +1,121 @@
+name: deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/myapp
+
+jobs:
+
+  build-and-push:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Java 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: temurin
+          cache: maven
+
+      - name: Run tests
+        run: mvn -B test
+
+      - name: Compute image tag
+        id: meta
+        run: echo "tag=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build & push image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.tag }}
+            ${{ env.IMAGE_NAME }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare SSH
+        env:
+          VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$VPS_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          if ! ssh-keygen -y -f ~/.ssh/deploy_key > /dev/null 2>&1; then
+            echo "::error::Chiave SSH non parsabile"
+            exit 1
+          fi
+          ssh-keyscan -4 -T 15 -H "$VPS_HOST" >> ~/.ssh/known_hosts 2>/dev/null || \
+            echo "::warning::ssh-keyscan timeout; fallback su accept-new"
+
+      - name: Upload docker-compose.yml
+        run: |
+          scp -4 -i ~/.ssh/deploy_key -o StrictHostKeyChecking=accept-new \
+              docker-compose.yml \
+              ${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}:/opt/myapp/docker-compose.yml
+
+      - name: Deploy
+        env:
+          TAG: ${{ needs.build-and-push.outputs.tag }}
+        run: |
+          ssh -4 -i ~/.ssh/deploy_key -o StrictHostKeyChecking=accept-new \
+              ${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }} bash <<EOF
+            set -euo pipefail
+            cd /opt/myapp
+            echo "TAG=${TAG}" > .deploy-tag
+            echo "[deploy] pulling ghcr.io/zaknafein83/myapp:${TAG}"
+            TAG=${TAG} docker compose pull
+            TAG=${TAG} docker compose up -d
+            TAG=${TAG} docker compose ps
+          EOF
+
+      - name: Healthcheck
+        run: |
+          echo "Aspetto /q/health/ready ..."
+          for i in $(seq 1 20); do
+            if ssh -4 -i ~/.ssh/deploy_key -o StrictHostKeyChecking=accept-new \
+                   ${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }} \
+                 "curl -fsS --max-time 3 http://127.0.0.1:8080/q/health/ready > /dev/null"; then
+              echo "✅ healthcheck OK al tentativo $i"
+              exit 0
+            fi
+            echo "  tentativo $i fallito, riprovo tra 5s..."
+            sleep 5
+          done
+          echo "::error::healthcheck non passato dopo 100s"
+          ssh -4 -i ~/.ssh/deploy_key -o StrictHostKeyChecking=accept-new \
+              ${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }} \
+            "cd /opt/myapp && docker compose logs --tail=80 app" || true
+          exit 1
