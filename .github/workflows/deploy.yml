@@ -89,6 +89,8 @@ jobs:
       - name: Deploy
         env:
           TAG: ${{ needs.build-and-push.outputs.tag }}
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           ssh -4 -i ~/.ssh/deploy_key -o StrictHostKeyChecking=accept-new \
               ${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }} bash <<EOF
@@ -96,7 +98,12 @@ jobs:
             cd /opt/myapp
             echo "TAG=${TAG}" > .deploy-tag
             echo "[deploy] pulling ghcr.io/zaknafein83/myapp:${TAG}"
+            # Il pacchetto GHCR è privato come il repository: login con il token del workflow
+            # (vale solo durante il job), in una config Docker separata per questo progetto.
+            export DOCKER_CONFIG=/opt/myapp/.docker
+            echo "${GHCR_TOKEN}" | docker login ghcr.io -u "${GHCR_USER}" --password-stdin > /dev/null
             TAG=${TAG} docker compose pull
+            docker logout ghcr.io > /dev/null || true
             TAG=${TAG} docker compose up -d
             TAG=${TAG} docker compose ps
           EOF
